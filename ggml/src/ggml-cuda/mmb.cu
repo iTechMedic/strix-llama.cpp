@@ -983,7 +983,10 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
     return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
-int  mmb_min_t()   { return 512; }
+// Smallest GEMM row count for every MMB consumer (tokens; heads x tokens for the indexer score). gfx1151 / ROCm 10,
+// Qwen3.8-Flash-Next llama-bench median ms vs 512 on 85d8480: UD-Q4_K_XL 32 tok 198 -> 178, 473 tok 807 -> 531;
+// UD-IQ4_XS 32 tok 196 -> 174, 473 tok 684 -> 523. At 16 rows MMB was 5-6% slower than MMQ. Retest if MMQ or MMB tiles change.
+int  mmb_min_t()   { return 32; }
 int  mmb_f32split_mode(){ return 2; }
 bool mmb_f32split() { return true; }
 bool mmb_bf16w()    { return true; }
