@@ -10954,6 +10954,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool vis : {false, true}) test_cases.emplace_back(new test_indexer_score(blocks, 512, vis));
     }
     test_cases.emplace_back(new test_indexer_score(3001, 77, true));
+    // 32-508 score rows: MMB for leaf keys, the 512-row gate for keys that are a graph view (the model's pooled-key cache)
+    for (int queries : {8, 31, 127}) {
+        for (bool bounded : {false, true}) test_cases.emplace_back(new test_indexer_score(3001, queries, true, bounded));
+    }
     test_cases.emplace_back(new test_indexer_score(3001, 512, true, true));
     // with the compact visibility chain (fused on RDNA3.5 unless GGML_CUDA_DISABLE_IDX_VIS)
     for (int blocks : {64, 1000, 10112}) test_cases.emplace_back(new test_indexer_head_sum(blocks,4,512,1,false,false,0,1));
