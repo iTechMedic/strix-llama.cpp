@@ -983,7 +983,7 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
     return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
-// Smallest GEMM row count for every MMB consumer (tokens; heads x tokens for the indexer score). gfx1151 / ROCm 10,
+// Smallest GEMM row count for the MMB consumers (the QSA indexer score keeps 512, see below). gfx1151 / ROCm 10,
 // Qwen3.8-Flash-Next llama-bench median ms vs 512 on 85d8480: UD-Q4_K_XL 32 tok 198 -> 178, 473 tok 807 -> 531;
 // UD-IQ4_XS 32 tok 196 -> 174, 473 tok 684 -> 523. At 16 rows MMB was 5-6% slower than MMQ. Retest if MMQ or MMB tiles change.
 int  mmb_min_t()   { return 32; }
@@ -1059,7 +1059,10 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
     const int64_t K = src0->ne[0], M = src0->ne[1];
     if ((f32w ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
     const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
+    // an F32 operand produced by the graph (not a weight) = the QSA indexer score (pooled keys x queries, heads x tokens
+    // rows): it keeps the 512-row gate. At 8-31 tokens MMB changed its results with no measured gain (32K, within 3%).
+    const bool graph_src0 = f32w && src0->op != GGML_OP_NONE;
+    if (T < (graph_src0 ? 512 : mmb_min_t()) || T > INT32_MAX / 4) return false;
     return ggml_nrows(dst) == T;
 }
 
