@@ -1,0 +1,451 @@
+diff --git a/ci/strix-halo/correctness.sh b/ci/strix-halo/correctness.sh
+--- a/ci/strix-halo/correctness.sh
++++ b/ci/strix-halo/correctness.sh
+@@ -4,33 +4,41 @@
+ #
+ # For every model in $MODELS_DIR (wikitext-2 as one token stream, $CHUNKS consecutive chunks of $CTX tokens):
+ #   1. upstream llama-perplexity saves its logits (--kl-divergence-base) and reports its own final PPL
+-#   2. floor: upstream again, once per runtime change in $FLOOR_ARGS (';'-separated, default "-ub 256;-fa off"),
+-#      against those logits. How far upstream drifts from itself is the noise floor: a different ubatch changes the
+-#      GEMM shapes and with them upstream's own kernel choice (e.g. MMQ vs dequant + hipBLAS), -fa off takes the
+-#      other attention path. Every floor value is the worst over these runs.
++#   2. calibration: upstream again, once per runtime change in $FLOOR_ARGS (';'-separated, default "-ub 256;-fa off"),
++#      against those logits. This is a sensitivity measurement: a different ubatch changes GEMM shapes and kernel
++#      routes, -fa off takes the other attention path. It is not a repeatability floor and does not show that a
++#      difference of that size is harmless. Every calibration value is the worst over these runs.
+ #   3. this fork against the same logits (--kl-divergence): PPL(Q), mean KLD, 99th percentile KLD, same top p
+ #   4. only for a model that failed: the fork again with its own optimizations switched off ($STRICT_ENV). Not a
+-#      gate, a hint: if the failure goes away, it comes from one of the switched-off code paths.
++#      gate, a diagnostic hint: it reports whether the failure recurs with those switches off; cause is not established.
+ #
+-# The fork's PPL(Q) is compared against the upstream run's own final PPL, NOT against the "Mean PPL(base)"
+-# the fork prints: that one is recomputed from the saved base log-probs, which the KL base format stores as
+-# uint16 logits inside a 16-nat window (tools/perplexity/perplexity.cpp), so it reads low for some models
+-# (e.g. gemma) even when the fork matches upstream. PPL(Q) and the upstream final PPL are both computed over
+-# the same tokens (the second half of every chunk).
++# The fork's PPL(Q) is compared against the upstream run's own reported final PPL ("Final estimate", 4 decimals), NOT
++# against the "Mean PPL(base)" the fork prints: that one is recomputed from the saved base log-probs, which the KL base
++# format stores as uint16 logits inside a 16-nat window (tools/perplexity/perplexity.cpp). Neither value is an exact
++# FP32 comparison. KLD, its percentiles and top-1 are measured against the compressed (uint16, clipped) base.
+ #
+-# A model fails if any of these holds (floor = worst upstream-vs-upstream value):
+-#   - PPL(fork)/PPL(upstream) - 1        > max($PPL_TOL, $FLOOR_K x floor)    (one-sided: a lower PPL never fails)
+-#   - % tokens whose top-1 differs       > max($TOP_TOL, $FLOOR_K x floor)
+-#   - mean KLD vs upstream               > max($KLD_TOL, $FLOOR_K x floor)
+-#   - 99th percentile KLD vs upstream    > max($TAIL_TOL, $FLOOR_K x floor)   (the worst 1 % of the tokens)
+-#     (not the 99.9th percentile or the max: those rest on a handful of tokens, and upstream alone already shows
+-#     single tokens with KLD > 8 on long chunks when only its attention path changes)
+-#   - a run did not offload every layer to the GPU, or its output could not be parsed
++# Blocking policy ($GATE):
++#   fixed (default)  a model fails if |PPL(fork)/PPL(upstream) - 1| > PPL_TOL, top-1 differs on > TOP_TOL % of the
++#                    tokens, mean KLD > KLD_TOL, or the 99th percentile KLD > TAIL_TOL. The calibration is reported next
++#                    to each value and does not change a limit.
++#   adaptive         the calibration-relative rule of the PR as submitted (ac164e39b): every limit is
++#                    max(fixed limit, FLOOR_K x calibration) and the PPL limit is one-sided (a lower PPL never fails).
++#                    This widens limits from a sensitivity measurement; it is a policy proposal under review, not an
++#                    established correctness criterion. An incomplete or invalid calibration makes the model INCOMPLETE.
++#   The other policy's verdict is always shown as information. The 99th percentile is a cutoff: it bounds the KLD of
++#   the best-matching 99 % of the tokens and says nothing about the worst 1 % beyond that cutoff (99.9 % and max are
++#   shown, not gated). Also fails if a run did not offload every layer to the GPU.
+ #
++# Exit: 0 PASS, 1 FAIL (a fork result outside a limit, invalid, or a fork build/run failed), 2 INCOMPLETE (invalid
++# settings, no or incomplete model set, missing or invalid upstream reference, incomplete calibration under
++# GATE=adaptive, or a gate evaluation error). Numbers are accepted only as plain decimals of at most 9 integer and 9
++# fractional digits, and must also be finite after conversion.
++#
+ # Meant to run inside the ROCm container (see .github/workflows/strix-halo-correctness.yml), but works anywhere
+ # with ROCm, cmake and ninja:
+ #   SRC=. MODELS_DIR=~/models/ci TEXT=~/wikitext-2-raw/wiki.test.raw CACHE=~/ci-cache ci/strix-halo/correctness.sh
+ set -euo pipefail
++export LC_ALL=C
+ 
+ SRC=${SRC:-$(pwd)}
+ MODELS_DIR=${MODELS_DIR:-/models}
+@@ -38,11 +46,12 @@
+ CACHE=${CACHE:-/cache}
+ CHUNKS=${CHUNKS:-16}
+ CTX=${CTX:-2048}            # tokens per chunk; only the second half of every chunk is scored (>= CTX/2 tokens of context)
+-PPL_TOL=${PPL_TOL:-0.01}    # min allowed limit, relative PPL increase vs upstream
+-TOP_TOL=${TOP_TOL:-3}       # min allowed limit, % of tokens whose top-1 token differs from upstream
+-KLD_TOL=${KLD_TOL:-0.005}   # min allowed limit, mean KL divergence vs upstream
+-TAIL_TOL=${TAIL_TOL:-0.05}  # min allowed limit, 99th percentile of the per-token KL divergence vs upstream
+-FLOOR_K=${FLOOR_K:-2}       # the fork may drift from upstream up to FLOOR_K times as much as upstream drifts from itself
++GATE=${GATE:-fixed}         # fixed | adaptive, see above
++PPL_TOL=${PPL_TOL:-0.01}    # fixed limit, |PPL ratio - 1| (adaptive: minimum of the one-sided limit)
++TOP_TOL=${TOP_TOL:-3}       # fixed limit, % of tokens whose top-1 token differs from upstream
++KLD_TOL=${KLD_TOL:-0.005}   # fixed limit, mean KL divergence vs upstream
++TAIL_TOL=${TAIL_TOL:-0.05}  # fixed limit, 99th percentile of the per-token KL divergence vs upstream
++FLOOR_K=${FLOOR_K:-2}       # adaptive only: the fork may drift up to FLOOR_K times the calibration
+ IFS=';' read -r -a FLOOR_SETS <<< "${FLOOR_ARGS:--ub 256;-fa off}"
+ # the fork's own code paths, off (unknown variables are ignored, so this may name switches a fork build lacks)
+ STRICT_ENV=${STRICT_ENV:-GGML_CUDA_DISABLE_MMB=1 GGML_CUDA_DISABLE_MMQ_TUNE=1 GGML_GDN_CHUNK=0 GGML_CUDA_DISABLE_SGMA=1 GGML_CUDA_DISABLE_MOE_SGMA=1 GGML_CUDA_DISABLE_GDN_QKNORM=1 GGML_CUDA_DISABLE_GDN_CONV=1 GGML_CUDA_DISABLE_GDN_OUTNORM=1 GGML_CUDA_DISABLE_GDN_GATE=1 GGML_CUDA_DISABLE_WEIGHTED_DOWN=1 GGML_CUDA_DISABLE_F32_DUAL=1 GGML_CUDA_DISABLE_MMID_512=1 GGML_CUDA_DISABLE_MMV_GROUP=1 GGML_CUDA_DISABLE_IDX_GEMM=1}
+@@ -50,16 +59,33 @@
+ UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/ggml-org/llama.cpp.git}
+ OUT=${OUT:-$SRC/correctness}
+ 
++# ---- settings: syntax, then the converted value must be finite and in range ----------------------------------
++incomplete() { echo "INCOMPLETE: $*"; exit 2; }
++INT='^[1-9][0-9]{0,8}$'
++DEC='^[0-9]{1,9}([.][0-9]{1,9})?$'
++SDEC='^-?[0-9]{1,9}([.][0-9]{1,9})?$'
++# finite test that does not rely on NaN comparisons (some awks treat NaN as equal to every number): C printf spells
++# non-finite values as inf/nan, finite %g output never contains an n or an i
++FIN='function fin(x) { return sprintf("%g", x) !~ /[nNiI]/ }'
++numok() { [[ $1 =~ $2 ]] && awk -v x="$1" "$FIN BEGIN { x += 0; exit !(fin(x) && ($3)) }"; }
++[[ $GATE == fixed || $GATE == adaptive ]] || incomplete "GATE=$GATE must be fixed or adaptive"
++for v in CHUNKS CTX; do numok "${!v}" "$INT" 'x >= 1' || incomplete "$v=${!v} is not a positive integer below 1e9"; done
++for v in PPL_TOL KLD_TOL TAIL_TOL FLOOR_K; do numok "${!v}" "$DEC" 'x >= 0' || incomplete "$v=${!v} is not a plain non-negative decimal"; done
++numok "$TOP_TOL" "$DEC" 'x >= 0 && x <= 100' || incomplete "TOP_TOL=$TOP_TOL is not a plain decimal between 0 and 100"
++(( ${#FLOOR_SETS[@]} > 0 )) || incomplete "FLOOR_ARGS has no runtime change"
++for s in "${FLOOR_SETS[@]}"; do [[ $s =~ ^\ *-[^\ ] ]] || incomplete "FLOOR_ARGS entry '$s' is not an option list"; done
++for e in "${STRICT[@]}"; do [[ $e =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || incomplete "STRICT_ENV entry '$e' is not VAR=value"; done
++
+ mkdir -p "$CACHE" "$OUT"
+ 
+-build() { # <src dir> <build dir>
++build() { # <src dir> <build dir> <exit status on failure: 2 upstream (reference), 1 fork>
+     cmake -S "$1" -B "$2" -G Ninja \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 \
+         -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+         -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+-        -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF > "$2.cmake.log"
+-    cmake --build "$2" --target llama-perplexity -j "$(nproc)" > "$2.build.log" 2>&1 || { tail -50 "$2.build.log"; exit 1; }
++        -DLLAMA_BUILD_TOOLS=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF > "$2.cmake.log" 2>&1 || { tail -50 "$2.cmake.log"; exit "$3"; }
++    cmake --build "$2" --target llama-perplexity -j "$(nproc)" > "$2.build.log" 2>&1 || { tail -50 "$2.build.log"; exit "$3"; }
+ }
+ 
+ ROCM_VERSION=$(cat /opt/rocm/.info/version 2>/dev/null || hipconfig --version 2>/dev/null || echo unknown)
+@@ -77,12 +103,12 @@
+ git -C "$UP" checkout -q --force FETCH_HEAD
+ UP_SHA=$(git -C "$UP" rev-parse --short HEAD)
+ echo "upstream $UP_SHA ($(git -C "$UP" log -1 --format=%cs))"
+-build "$UP" "$CACHE/build-upstream"
++build "$UP" "$CACHE/build-upstream" 2
+ 
+ echo "== fork"
+ FORK_SHA=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
+ echo "fork $FORK_SHA"
+-build "$SRC" "$SRC/build-correctness"
++build "$SRC" "$SRC/build-correctness" 1
+ 
+ UP_BIN=$CACHE/build-upstream/bin/llama-perplexity
+ FK_BIN=$SRC/build-correctness/bin/llama-perplexity
+@@ -101,19 +127,26 @@
+         echo
+         echo "GPU: $GPU. ROCm $ROCM_VERSION, $HIPCC_VERSION, image \`${IMAGE:-unknown}\`${IMAGE_ID:+ (\`${IMAGE_ID:0:19}\`)}."
+         echo
+-        echo "wikitext-2 test, ctx $CTX, $CHUNKS chunks. PPL upstream is upstream's own final estimate."
+-        echo "Floor: the worst of upstream vs upstream with$(printf ' `%s`,' "${FLOOR_SETS[@]}" | sed 's/,$//')."
+-        echo "Each cell: fork value (floor / limit). Limit = max(fixed limit, $FLOOR_K x floor); fixed limits: PPL ratio - 1 $PPL_TOL"
+-        echo "(a lower PPL never fails), top-1 differs $TOP_TOL %, mean KLD $KLD_TOL, 99 % KLD $TAIL_TOL. 99.9 % and max KLD are shown, not gated."
++        echo "wikitext-2 test, ctx $CTX, $CHUNKS chunks. PPL upstream is upstream's own reported final estimate."
++        echo "Calibration (sensitivity, not a noise floor): the worst of upstream vs upstream with$(printf ' `%s`,' "${FLOOR_SETS[@]}" | sed 's/,$//')."
++        if [[ $GATE == fixed ]]; then
++            echo "Blocking policy: fixed limits. |PPL ratio - 1| $PPL_TOL, top-1 differs $TOP_TOL %, mean KLD $KLD_TOL, 99 % KLD $TAIL_TOL."
++            echo "Each cell: fork value (calibration / limit). The calibration-relative verdict (FLOOR_K $FLOOR_K) is shown for information only."
++        else
++            echo "Blocking policy: ADAPTIVE (under review). Limit = max(fixed limit, $FLOOR_K x calibration); PPL one-sided (a lower PPL"
++            echo "never fails); fixed limits: PPL ratio - 1 $PPL_TOL, top-1 differs $TOP_TOL %, mean KLD $KLD_TOL, 99 % KLD $TAIL_TOL."
++            echo "Each cell: fork value (calibration / limit). The fixed-limit verdict is shown for information."
++        fi
++        echo "99 % KLD is a cutoff over the tokens, not a bound on the worst 1 %; 99.9 % and max KLD are shown, not gated."
+         echo "Also fails if a run did not offload every layer to the GPU."
+         echo
+-        echo "| model | PPL upstream | PPL fork | PPL ratio - 1 | top-1 differs % | mean KLD | 99 % KLD | 99.9 % KLD | max KLD | result |"
+-        echo "|---|---|---|---|---|---|---|---|---|---|"
++        echo "| model | PPL upstream | PPL fork | PPL ratio - 1 | top-1 differs % | mean KLD | 99 % KLD | 99.9 % KLD | max KLD | result | calibration; other policy |"
++        echo "|---|---|---|---|---|---|---|---|---|---|---|"
+         printf '%s\n' "${rows[@]}"
+         if [[ ${#diags[@]} -gt 0 ]]; then
+             echo
+-            echo "Failed models, fork rerun with its own optimizations off (\`$STRICT_ENV\`). Not a gate: if the failure"
+-            echo "goes away, it comes from one of the switched-off code paths."
++            echo "Failed models, fork rerun with its own optimizations off (\`$STRICT_ENV\`). Diagnostic only;"
++            echo "a changed result does not establish the cause of the original failure."
+             echo
+             echo "| model | top-1 differs % | mean KLD | 99 % KLD | 99.9 % KLD | max KLD | reading |"
+             echo "|---|---|---|---|---|---|---|"
+@@ -121,12 +154,33 @@
+         fi
+     } > "$SUMMARY"
+ }
++row() { rows+=("| $1 | ${2:-} | ${3:-} | ${4:-} | ${5:-} | ${6:-} | ${7:-} | ${8:-} | ${9:-} | ${10} | ${11:-} |"); }
+ 
+-fail=0
++# models: single-file GGUFs and complete split sets (passed as their first shard); incomplete sets are reported
++models=()
++problems=()
+ shopt -s nullglob
+-models=("$MODELS_DIR"/*.gguf)
+-[[ ${#models[@]} -gt 0 ]] || { echo "no models in $MODELS_DIR"; exit 1; }
++for m in "$MODELS_DIR"/*.gguf; do
++    if [[ $m =~ ^(.*)-([0-9]{5})-of-([0-9]{5})[.]gguf$ ]]; then
++        stem=${BASH_REMATCH[1]} idx=${BASH_REMATCH[2]} total=${BASH_REMATCH[3]}
++        if [[ $idx != 00001 ]]; then
++            [[ -e $stem-00001-of-$total.gguf ]] || problems+=("$(basename "$m"): first shard missing")
++            continue
++        fi
++        for ((i = 2; i <= 10#$total; i++)); do
++            printf -v shard '%s-%05d-of-%s.gguf' "$stem" "$i" "$total"
++            [[ -e $shard ]] || { problems+=("$(basename "$shard") missing"); continue 2; }
++        done
++    fi
++    models+=("$m")
++done
+ 
++fail=0
++missing=0
++evaluated=0
++for p in "${problems[@]}"; do row "$p" "" "" "" "" "" "" "" "" "INCOMPLETE (model set)"; missing=1; done
++(( ${#models[@]} > 0 )) || { row "(none)" "" "" "" "" "" "" "" "" "INCOMPLETE (no model)"; missing=1; }
++
+ # <log> <pattern>: the value after the last ':' of the first matching line, '' if there is none
+ val() { grep -m1 "$2" "$1" | sed -E 's/.*: *//; s/ *±.*//; s/ *%//' | tr -d ' ' || true; }
+ # <log>: "ok" if every layer was offloaded to the GPU, else what was found
+@@ -143,10 +197,64 @@
+     done
+     echo "$out"
+ }
++# <ppl> <top> <kld> <p99>: the four gated values are usable (PPL > 0, top-1 0-100, KLD values finite)
++usable() {
++    numok "$1" "$DEC" 'x > 0' && numok "$2" "$DEC" 'x <= 100' && numok "$3" "$SDEC" 1 && numok "$4" "$SDEC" 1
++}
+ 
++# <ppl_b> <ppl_q> <top> <kld> <p99> <floors>: one line "c_ppl c_top c_kld c_tail fixed_why adaptive_why END", cells
++# "value_(calibration_/_limit)" for the blocking policy, why = '-' or comma-separated reasons. Exit 3 on a non-finite
++# derived value. The caller checks the exit status and the shape of the line.
++gate() {
++    awk -v b="$1" -v q="$2" -v top="$3" -v k="$4" -v p="$5" -v fl="$6" -v f="$FLOOR_K" -v mode="$GATE" \
++        -v t="$PPL_TOL" -v tt="$TOP_TOL" -v kt="$KLD_TOL" -v pt="$TAIL_TOL" "$FIN"'
++    function mx(a, c) { return a > c ? a : c }
++    function cell(v, fv, lim, fmt) {
++        return sprintf(fmt, v) "_(" (fv == "" ? "n/a" : sprintf(fmt, fv)) "_/_" sprintf(fmt, lim) ")" }
++    BEGIN {
++        b += 0; q += 0; top += 0; k += 0; p += 0; t += 0; tt += 0; kt += 0; pt += 0; f += 0
++        # worst calibration values over the calibration runs (all validated by the caller)
++        n = split(fl, runs, ";"); rf = df = kf = pf = ""
++        for (i = 1; i <= n; i++) {
++            if (split(runs[i], s, " ") < 4) continue
++            d = s[1] / b - 1; if (d < 0) d = -d
++            rf = rf == "" ? d : mx(rf, d)
++            df = df == "" ? 100 - s[2] : mx(df, 100 - s[2])
++            kf = kf == "" ? s[3] + 0 : mx(kf, s[3] + 0)
++            pf = pf == "" ? s[4] + 0 : mx(pf, s[4] + 0)
++        }
++        r = q / b - 1; ra = r < 0 ? -r : r; d = 100 - top
++        # fixed: declared limits, two-sided PPL
++        wf = ""
++        if (ra > t)  wf = wf ",PPL"
++        if (d > tt)  wf = wf ",top-1"
++        if (k > kt)  wf = wf ",KLD"
++        if (p > pt)  wf = wf ",KLD_tail"
++        # adaptive: max(fixed, K x calibration), one-sided PPL
++        rl = mx(t, f * rf); dl = mx(tt, f * df); kl = mx(kt, f * kf); pl = mx(pt, f * pf)
++        wa = ""
++        if (r > rl)  wa = wa ",PPL"
++        if (d > dl)  wa = wa ",top-1"
++        if (k > kl)  wa = wa ",KLD"
++        if (p > pl)  wa = wa ",KLD_tail"
++        if (!fin(r) || !fin(d) || !fin(rl) || !fin(dl) || !fin(kl) || !fin(pl)) exit 3
++        if (mode == "fixed") { lr = t; ld = tt; lk = kt; lp = pt } else { lr = rl; ld = dl; lk = kl; lp = pl }
++        printf "%s %s %s %s %s %s END\n", cell(r, rf, lr, "%+.4f"), cell(d, df, ld, "%.2f"),
++            cell(k, kf, lk, "%.6f"), cell(p, pf, lp, "%.4f"),
++            (wf == "" ? "-" : substr(wf, 2)), (wa == "" ? "-" : substr(wa, 2)) }'
++}
++# <ppl_b> <ppl_q> <top> <kld> <p99> <floors>: sets g (array) from a checked gate run; fails if the run or its output is bad
++GATE_LINE='^[^ ]+ [^ ]+ [^ ]+ [^ ]+ (-|[A-Za-z0-9_,-]+) (-|[A-Za-z0-9_,-]+) END$'
++run_gate() {
++    local line
++    line=$(gate "$@") || return 1
++    [[ $line =~ $GATE_LINE ]] || return 1
++    read -r -a g <<< "$line"
++}
++sp() { echo "${1//_/ }"; }
++why_text() { local w=${1//_/ }; echo "${w//,/, }"; }
++
+ for m in "${models[@]}"; do
+-    # split models: only pass the first shard, llama.cpp finds the rest next to it
+-    [[ $m =~ -[0-9]{5}-of-[0-9]{5}\.gguf$ && ! $m =~ -00001-of-[0-9]{5}\.gguf$ ]] && continue
+     name=$(basename "$m" .gguf)
+     name=${name%-00001-of-*}
+     echo "== $name"
+@@ -158,32 +266,44 @@
+ 
+     if ! "$UP_BIN" -m "$m" "${PPL_ARGS[@]}" --kl-divergence-base "$base" > "$up_log" 2>&1; then
+         echo "upstream failed on $name"; tail -20 "$up_log"
+-        rows+=("| $name | error | | | | | | | | FAIL (upstream run) |"); fail=1; rm -f "$base"; write_summary; continue
++        row "$name" "error" "" "" "" "" "" "" "" "INCOMPLETE (upstream run)"; missing=1; rm -f "$base"; write_summary; continue
+     fi
+     [[ $GPU == unknown ]] && GPU=$(grep -m1 -oE 'ROCm0 \([^)]*\)' "$up_log" || true)
+     [[ -n $GPU ]] || GPU=unknown
++    # the reference must be usable before anything is compared with it
++    ppl_b=$(grep -m1 'Final estimate: PPL' "$up_log" | sed -E 's/.*PPL = *//; s/ *\+.*//; s/ //g' || true)
++    if ! numok "$ppl_b" "$DEC" 'x > 0'; then
++        echo "upstream PPL of $name is not usable: '$ppl_b'"
++        row "$name" "${ppl_b:-missing}" "" "" "" "" "" "" "" "INCOMPLETE (upstream PPL)"; missing=1; rm -f "$base"; write_summary; continue
++    fi
+ 
+-    # floor runs: "ppl top kld p99 p999 max" per run that worked, ';'-separated
+-    floors=""; logs=("$up_log")
++    # calibration runs: "ppl top kld p99 p999 max" per usable run, ';'-separated; problems are reported, not dropped
++    floors=""; logs=("$up_log"); cal=()
+     for i in "${!FLOOR_SETS[@]}"; do
+         read -r -a fa <<< "${FLOOR_SETS[$i]}"
+         fl_log=$OUT/$name.floor$((i + 1)).log
+         if "$UP_BIN" -m "$m" "${PPL_ARGS[@]}" "${fa[@]}" --kl-divergence-base "$base" --kl-divergence > "$fl_log" 2>&1; then
+             s=$(stats "$fl_log")
+-            echo "floor ${FLOOR_SETS[$i]}: PPL top KLD p99 p99.9 max =$s"
+-            floors="$floors;$s"; logs+=("$fl_log")
++            read -r f_ppl f_top f_kld f_tail _ <<< "$s"
++            logs+=("$fl_log")
++            if usable "$f_ppl" "$f_top" "$f_kld" "$f_tail"; then
++                echo "calibration ${FLOOR_SETS[$i]}: PPL top KLD p99 p99.9 max =$s"
++                floors="$floors;$s"
++            else
++                echo "calibration '${FLOOR_SETS[$i]}' on $name gave unusable values:$s"; cal+=("'${FLOOR_SETS[$i]}' invalid")
++            fi
+         else
+-            echo "floor run '${FLOOR_SETS[$i]}' failed on $name, left out"; tail -20 "$fl_log"
++            echo "calibration run '${FLOOR_SETS[$i]}' failed on $name"; tail -20 "$fl_log"; cal+=("'${FLOOR_SETS[$i]}' failed")
+         fi
+     done
++    cal_note="calibration ok"
++    if (( ${#cal[@]} > 0 )); then cal_note="calibration: $(IFS=,; echo "${cal[*]}")"; fi
+ 
+     if ! "$FK_BIN" -m "$m" "${PPL_ARGS[@]}" --kl-divergence-base "$base" --kl-divergence > "$fk_log" 2>&1; then
+         echo "fork failed on $name"; tail -20 "$fk_log"
+-        rows+=("| $name | | error | | | | | | | FAIL (fork run) |"); fail=1; rm -f "$base"; write_summary; continue
++        row "$name" "$ppl_b" "error" "" "" "" "" "" "" "FAIL (fork run)" "$cal_note"; fail=1; rm -f "$base"; write_summary; continue
+     fi
+     logs+=("$fk_log")
+-
+-    ppl_b=$(grep -m1 'Final estimate: PPL' "$up_log" | sed -E 's/.*PPL = *//; s/ *\+.*//; s/ //g' || true)
+     read -r ppl_q top kld tail p999 kmax <<< "$(stats "$fk_log")"
+ 
+     off=""
+@@ -191,64 +311,60 @@
+         o=$(offload "$l")
+         [[ $o == ok ]] || off="$off $(basename "$l" .log | sed 's/.*\.//'): $o;"
+     done
++    [[ -n $off ]] && echo "offload:$off"
+ 
+-    # <ppl_q> <top> <kld> <tail>: "cells... reasons", cells are "value (floor / limit)" with '_' for spaces
+-    gate() {
+-        LC_ALL=C awk -v b="$ppl_b" -v q="$1" -v top="$2" -v k="$3" -v p="$4" -v fl="$floors" -v f="$FLOOR_K" \
+-            -v t="$PPL_TOL" -v tt="$TOP_TOL" -v kt="$KLD_TOL" -v pt="$TAIL_TOL" '
+-        function mx(a, c) { return a > c ? a : c }
+-        function cell(v, fv, lim, fmt) {
+-            return sprintf(fmt, v) "_(" (fv == "" ? "n/a" : sprintf(fmt, fv)) "_/_" sprintf(fmt, lim) ")" }
+-        BEGIN {
+-            if (b == "" || q == "-" || top == "-" || k == "-" || p == "-") { print "- - - - parse_error"; exit }
+-            # worst floor values over the floor runs that parsed
+-            n = split(fl, runs, ";"); rf = df = kf = pf = ""
+-            for (i = 1; i <= n; i++) {
+-                if (split(runs[i], s, " ") < 4 || s[1] == "-" || s[2] == "-" || s[3] == "-" || s[4] == "-") continue
+-                d = s[1] / b - 1; if (d < 0) d = -d
+-                rf = rf == "" ? d : mx(rf, d)
+-                df = df == "" ? 100 - s[2] : mx(df, 100 - s[2])
+-                kf = kf == "" ? s[3] : mx(kf, s[3])
+-                pf = pf == "" ? s[4] : mx(pf, s[4])
+-            }
+-            rl = mx(t, f * rf); dl = mx(tt, f * df); kl = mx(kt, f * kf); pl = mx(pt, f * pf)
+-            r = q / b - 1; d = 100 - top
+-            w = ""
+-            if (r > rl) w = w ",PPL"
+-            if (d > dl) w = w ",top-1"
+-            if (k > kl) w = w ",KLD"
+-            if (p > pl) w = w ",KLD_tail"
+-            if (w == "") w = ",-"
+-            printf "%s %s %s %s %s\n", cell(r, rf, rl, "%+.4f"), cell(d, df, dl, "%.2f"),
+-                cell(k, kf, kl, "%.6f"), cell(p, pf, pl, "%.4f"), substr(w, 2) }'
+-    }
+-
+-    read -r c_ppl c_top c_kld c_tail why <<< "$(gate "$ppl_q" "$top" "$kld" "$tail")"
+-    [[ $why == - ]] && why=""
+-    gated=$why
+-    [[ -n $off ]] && why="${why:+$why,}offload"
+-    if [[ -z $why ]]; then
+-        res=OK
++    if ! usable "$ppl_q" "$top" "$kld" "$tail"; then
++        echo "fork values of $name are not usable: PPL $ppl_q top $top KLD $kld p99 $tail"
++        row "$name" "$ppl_b" "$ppl_q" "" "$top" "$kld" "$tail" "$p999" "$kmax" "FAIL (invalid metric${off:+, offload})" "$cal_note"
++        fail=1; evaluated=$((evaluated + 1)); rm -f "$base"; write_summary; continue
++    fi
++    if [[ $GATE == adaptive && ${#cal[@]} -gt 0 ]]; then
++        row "$name" "$ppl_b" "$ppl_q" "" "" "$kld" "$tail" "$p999" "$kmax" "INCOMPLETE (calibration)" "$cal_note"
++        missing=1; rm -f "$base"; write_summary; continue
++    fi
++    if ! run_gate "$ppl_b" "$ppl_q" "$top" "$kld" "$tail" "$floors"; then
++        echo "gate evaluation failed on $name"
++        row "$name" "$ppl_b" "$ppl_q" "" "" "$kld" "$tail" "$p999" "$kmax" "INCOMPLETE (gate error)" "$cal_note"
++        missing=1; rm -f "$base"; write_summary; continue
++    fi
++    evaluated=$((evaluated + 1))
++    if [[ $GATE == fixed ]]; then
++        gated=${g[4]}; other_policy=adaptive; other_why=${g[5]}
+     else
+-        why=${why//_/ }
+-        res="FAIL (${why//,/, })"; fail=1
++        gated=${g[5]}; other_policy=fixed; other_why=${g[4]}
+     fi
+-    [[ -n $off ]] && echo "offload:$off"
+-    sp() { echo "${1//_/ }"; }
+-    echo "PPL upstream $ppl_b fork $ppl_q | ratio-1 $(sp "$c_ppl") | top-1 differs % $(sp "$c_top") | KLD $(sp "$c_kld") | p99 $(sp "$c_tail") | p99.9 $p999 | max $kmax -> $res"
+-    rows+=("| $name | $ppl_b | $ppl_q | $(sp "$c_ppl") | $(sp "$c_top") | $(sp "$c_kld") | $(sp "$c_tail") | $p999 | $kmax | $res |")
++    # The alternate verdict includes the same prerequisites as selecting that policy.
++    if [[ $other_policy == adaptive && ${#cal[@]} -gt 0 ]]; then
++        other="adaptive: INCOMPLETE (calibration)"
++    else
++        [[ $other_why == - ]] && other_why=""
++        [[ -n $off ]] && other_why="${other_why:+$other_why,}offload"
++        if [[ -z $other_why ]]; then other="$other_policy: OK"
++        else other="$other_policy: FAIL ($other_why)"; fi
++    fi
++    why=""
++    [[ $gated == - ]] || why=$gated
++    [[ -n $off ]] && why="${why:+$why,}offload"
++    if [[ -z $why ]]; then res=OK; else res="FAIL ($(why_text "$why"))"; fail=1; fi
++    other=$(why_text "$other")
++    echo "PPL upstream $ppl_b fork $ppl_q | ratio-1 $(sp "${g[0]}") | top-1 differs % $(sp "${g[1]}") | KLD $(sp "${g[2]}") | p99 $(sp "${g[3]}") | p99.9 $p999 | max $kmax -> $res [$cal_note; $other]"
++    row "$name" "$ppl_b" "$ppl_q" "$(sp "${g[0]}")" "$(sp "${g[1]}")" "$(sp "${g[2]}")" "$(sp "${g[3]}")" "$p999" "$kmax" "$res" "$cal_note; $other"
+ 
+-    # failed on the numbers (not on offload or parsing): rerun the fork with its own code paths off
+-    if [[ -n $gated && $gated != parse_error && ${#STRICT[@]} -gt 0 ]]; then
++    # failed on the numbers (not on offload alone): rerun the fork with its own code paths off; a hint, not a gate
++    if [[ $gated != - && ${#STRICT[@]} -gt 0 ]]; then
++        reading=""
+         if env "${STRICT[@]}" "$FK_BIN" -m "$m" "${PPL_ARGS[@]}" --kl-divergence-base "$base" --kl-divergence > "$st_log" 2>&1; then
+             read -r s_ppl s_top s_kld s_tail s_p999 s_max <<< "$(stats "$st_log")"
+-            read -r _ _ _ _ s_why <<< "$(gate "$s_ppl" "$s_top" "$s_kld" "$s_tail")"
+-            case $s_why in
+-                -)           reading="passes: the failure comes from a switched-off fork path" ;;
+-                parse_error) reading="could not be parsed" ;;
+-                *)           reading="still fails (${s_why//,/, }): not (only) the switched-off paths"; reading=${reading//_/ } ;;
+-            esac
+-            s_d=$(LC_ALL=C awk -v t="$s_top" 'BEGIN { if (t == "-") print "-"; else printf "%.2f", 100 - t }')
++            if ! usable "$s_ppl" "$s_top" "$s_kld" "$s_tail"; then
++                reading="could not be evaluated: unusable values"
++            elif ! run_gate "$ppl_b" "$s_ppl" "$s_top" "$s_kld" "$s_tail" "$floors"; then
++                reading="could not be evaluated: gate error"
++            else
++                if [[ $GATE == fixed ]]; then s_why=${g[4]}; else s_why=${g[5]}; fi
++                if [[ $s_why == - ]]; then reading="passes with switches off; cause not established"
++                else reading="still fails ($(why_text "$s_why")); cause not established"; fi
++            fi
++            s_d=$(awk -v t="$s_top" 'BEGIN { if (t == "-") print "-"; else printf "%.2f", 100 - t }')
+             echo "strict: top-1 differs $s_d %, KLD $s_kld, p99 $s_tail, p99.9 $s_p999, max $s_max -> $reading"
+             diags+=("| $name | $s_d | $s_kld | $s_tail | $s_p999 | $s_max | $reading |")
+         else
+@@ -260,7 +376,10 @@
+     write_summary
+ done
+ 
++(( evaluated > 0 )) || { [[ ${#models[@]} -eq 0 ]] || row "(none)" "" "" "" "" "" "" "" "" "INCOMPLETE (no model evaluated)"; missing=1; }
+ write_summary
+ echo
+ cat "$SUMMARY"
+-exit $fail
++(( fail == 0 )) || exit 1
++(( missing == 0 )) || exit 2
++exit 0
