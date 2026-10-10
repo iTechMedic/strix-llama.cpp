@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "created": "2026-10-10",
+  "status": "BOOTSTRAP_NOT_VALIDATED",
+  "strix_baseline": "6aa81b88e14aa753c1c7e1a9ff27c9d50fd3c673",
+  "legacy_daily_source": "8c1c282ecb194e8f02613defcc4a07c22b6d1c08",
+  "validated_branch_state": "Legacy source reference only; no fresh validation or deployment performed.",
+  "additional_code_changes": [],
+  "promotions": [],
+  "mainline_observed": "23b0202a189c44a54625aadcb37a946dd1d6278d",
+  "automatic_sync": false,
+  "automatic_deployment": false
+}
