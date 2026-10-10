@@ -42,13 +42,15 @@ Update `strix-upstream` explicitly to verified community history, then reconcile
 
 No scheduled sync, automatic merging, automatic promotion, deployment, new CI workload or issue/comment publication is configured by this setup. GitHub Actions was disabled in the fork at setup and is left disabled. Further pushes and external posts require the owner's authorization under the local project guide.
 
-## Initial change ledger
+## Change ledger
 
 | Candidate | State | Next gate |
 | --- | --- | --- |
-| [Image-history QSA, Strix PR #163](https://github.com/halo-box/strix-llama.cpp/pull/163) | Separate PR branch preserved; not integrated by this setup. | Recheck live head/review and approve intentional image-selection semantics before promotion. |
+| [Image-history QSA, Strix PR #163](https://github.com/halo-box/strix-llama.cpp/pull/163) | Integrated from `0a3e66dd2f824925882b2e65986672f4aba1d4cc` in merge `4e2bdbb2920bdb9447ffdb93fc51cb7e028a3e83`; original commits preserved. | Code tree matches the tested candidate outside docs/fork. Existing s50 evidence reused; no fresh GPU tests or daily promotion. |
 | Concurrent foreign-image QSA scan crash fix | Separate local candidate; CPU regression and CodeRabbit review available, not integrated by this setup. | Full-model ROCm/Vulkan validation and current overlap check. |
 | Selected mainline improvements | None selected or integrated. | Scope, provenance, compatibility and correctness review. |
+
+PR #163 was integrated on 2026-10-10 with David's approval for experimental use after disclosure of its intentional image-selection change. This does not promote it to `validated`, assert image equivalence, or fix the separate concurrent foreign-image full-scan crash. The initial branch table and bootstrap.json are historical setup records; changes.json records subsequent integrations. Revalidate each later code combination before daily promotion.
 
 Keep private workloads, screenshots, model data and raw benchmark artifacts out of the public repository. Store detailed evidence in the local StrixFork campaign workspace, and publish only reviewed summaries.
 

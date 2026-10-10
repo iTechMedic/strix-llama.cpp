@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "changes": [
+    {
+      "id": "strix-pr-163",
+      "source_url": "https://github.com/halo-box/strix-llama.cpp/pull/163",
+      "source_commit": "0a3e66dd2f824925882b2e65986672f4aba1d4cc",
+      "source_base": "6aa81b88e14aa753c1c7e1a9ff27c9d50fd3c673",
+      "integration_merge_commit": "4e2bdbb2920bdb9447ffdb93fc51cb7e028a3e83",
+      "source_tree": "58c317768a7b9357d97845a2dfc24db15663b18f",
+      "source_diff_sha256": "e2b1c17f423c20037963b3d9c1464101a4816162c127d59a676819adec790baa",
+      "date": "2026-10-10",
+      "status": "INTEGRATED_EXISTING_EVIDENCE_REUSED",
+      "conflict_resolutions": [],
+      "code_identity": "Every tracked path outside docs/fork is identical to the tested source commit.",
+      "approval": "David approved integrating the pinned revision after disclosure of image-selection semantics; no daily promotion approved.",
+      "existing_evidence": "s50 ROCm/Vulkan correctness, verifier, performance and near-limit record for an identical source tree; see public PR and local campaign-s50/pr163/RESULTS.md.",
+      "fresh_gpu_tests": false,
+      "deployed": false,
+      "limitations": [
+        "Intentional image-selection change; image equivalence not claimed.",
+        "Known concurrent foreign-image full-scan assertion remains outside this change.",
+        "Existing near-limit run and other source-report coverage limits remain applicable."
+      ],
+      "next_gate": "Validate any subsequent code combination before daily promotion; preserve recorded source-report limitations."
+    }
+  ],
+  "promotions": []
+}
