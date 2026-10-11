@@ -23,6 +23,38 @@
         "Existing near-limit run and other source-report coverage limits remain applicable."
       ],
       "next_gate": "Validate any subsequent code combination before daily promotion; preserve recorded source-report limitations."
+    },
+    {
+      "id": "strix-pr-165",
+      "source_url": "https://github.com/halo-box/strix-llama.cpp/pull/165",
+      "source_commit": "c2aae46b8a1bea1be264921c60eab8e58d1d15dc",
+      "source_base": "6aa81b88e14aa753c1c7e1a9ff27c9d50fd3c673",
+      "integration_merge_commit": "28b066c944dd7515b455b11225b3a5ae898acbd8",
+      "previous_integration": "4798c92287959be7737857b21a7948bfb48b5fba",
+      "source_diff_sha256": "fa8ebb8a9d49744f6217a882e3ba202730eb4ad2eca3e8b89c23528e89cc8220",
+      "date": "2026-10-10",
+      "status": "INTEGRATED_CPU_TARGET_CHECKS_PASS_FULL_MODEL_COMBINATION_PENDING",
+      "conflict_resolutions": [
+        "tests/test-qsa-prefix.cpp: preserve all PR163 tests and insert the unchanged PR165 regression plus its includes and main call."
+      ],
+      "code_identity": "Production patch matches PR165 exactly after normalizing line offsets and blob hashes. Existing PR163 tests are unchanged; PR165 regression body is unchanged.",
+      "approval": "David approved merging this bug fix into the personal fork integration branch; no daily promotion approved.",
+      "existing_evidence": "Independent ROCm/Vulkan target validation for PR165 in local campaign-qsa-scan-crash-codex/s51, including seeded MTP follow-up; public PR describes limits.",
+      "combined_validation": {
+        "scope": "macOS CPU Debug; three QSA test suites including the foreign-image scan regression, mrope ranks, position holes and recovery checks",
+        "tests_passed": 3,
+        "tests_failed": 0,
+        "compatibility": "External preinclude stubs the unrelated Linux posix_fadvise hint for the macOS build; not included in the production patch. These tests do not execute disk prefetch.",
+        "full_model_backends": "Not run on the combined build; ROCm/Vulkan model validation remains required before promotion."
+      },
+      "fresh_gpu_tests": false,
+      "deployed": false,
+      "limitations": [
+        "Existing source-PR validation gaps remain applicable.",
+        "The combined PR163/PR165 build has CPU regression evidence only; do not transfer separate full-model results as proof of the combination.",
+        "No new performance or memory claim."
+      ],
+      "next_gate": "Validate the combined PR163/PR165 build on the target ROCm/Vulkan model and production configurations before daily promotion."
     }
   ],
   "promotions": []
